@@ -91,10 +91,47 @@ class MeadowClient:
         return self._authenticated
 
     def on(self, event: EventName | str, handler: Handler) -> None:
-        """Register a handler for an event on the /chat namespace."""
+        """Register a handler for an event on the /chat namespace.
+
+        BUSINESS RULE: python-socketio's on() replaces existing handlers
+        (dict assignment, not append). The client has internal handlers
+        for AUTHENTICATED, BOT_AUTHENTICATED, AUTH_ERROR, and ERROR that
+        must always run (they set connection state). If a user registers
+        a handler for the same event, we chain: internal handler runs
+        first, then the user's handler. This prevents a bot's
+        on_bot_authenticated from silently overriding the client's
+        _on_authenticated (which sets the authenticated flag).
+        """
         name = event.value if isinstance(event, EventName) else str(event)
         self._handlers[EventName(name) if name in {e.value for e in EventName} else name] = handler  # type: ignore[arg-type]
-        self.sio.on(name, handler, namespace=self.NAMESPACE)
+
+        # Chain with any existing handler (internal or user-registered).
+        existing = None
+        sio_handlers = getattr(self.sio, "handlers", None)
+        if sio_handlers is not None:
+            ns_handlers = sio_handlers.get(self.NAMESPACE, {})
+            if name in ns_handlers:
+                existing = ns_handlers[name]
+        else:
+            # FakeAsyncClient (tests) — check _handlers dict
+            for (evt, _ns), h in getattr(self.sio, "_handlers", {}).items():
+                if evt == name:
+                    existing = h
+                    break
+
+        if existing is None:
+            self.sio.on(name, handler, namespace=self.NAMESPACE)
+        else:
+
+            async def chained(_data: dict[str, Any]) -> None:
+                result = existing(_data)
+                if hasattr(result, "__await__"):
+                    await result
+                result = handler(_data)
+                if hasattr(result, "__await__"):
+                    await result
+
+            self.sio.on(name, chained, namespace=self.NAMESPACE)
 
     def on_connect(self, handler: ConnectHandler) -> None:
         """Register a handler fired when /chat namespace connects (post-auth)."""
