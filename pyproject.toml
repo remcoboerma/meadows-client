@@ -12,6 +12,7 @@ license-expression = "MIT"
 authors = [{ name = "MEADOWS" }]
 dependencies = [
     "meadows-protocol",
+    "aiohttp>=3.9.0",
     "python-socketio>=5.11.0",
     "pyjwt>=2.12.0",
 ]
