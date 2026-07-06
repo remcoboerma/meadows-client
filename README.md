@@ -26,6 +26,8 @@ uv run pytest -q
 
 ## Usage
 
+### Preferred: pre-signed JWT (only the server knows the signing key)
+
 ```python
 from meadows.client import MeadowClient
 from meadows.protocol import EventName, JWTRole, build_claims
@@ -33,13 +35,25 @@ from meadows.protocol import EventName, JWTRole, build_claims
 client = MeadowClient(
     server_url="http://localhost:8080",
     claims=build_claims(name="alice", role=JWTRole.USER),
-    jwt_secret=b"<shared key bytes>",
+    token="<pre-signed-jwt>",
 )
 
 client.on(EventName.MESSAGE, lambda data: print("got:", data))
 
 await client.connect()
 await client.send_message(content="hello world", group_id="general")
+```
+
+Generate a token with `inv user-jwt` or `inv bot-jwt` on the server.
+
+### Legacy: raw signing key (only for local dev / TUI)
+
+```python
+client = MeadowClient(
+    server_url="http://localhost:8080",
+    claims=build_claims(name="alice", role=JWTRole.USER),
+    jwt_secret=b"<shared key bytes>",
+)
 ```
 
 ## The protocol contract
