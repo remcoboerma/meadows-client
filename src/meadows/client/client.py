@@ -17,6 +17,7 @@ sees an invalid frame from us.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -87,6 +88,9 @@ class MeadowClient:
         self._handlers: dict[EventName, Handler] = {}
         self._connect_handlers: list[ConnectHandler] = []
         self._disconnect_handlers: list[ConnectHandler] = []
+        self._label_subscriptions: list[dict[str, Any]] = []  # for replay on reconnect
+        self._label_assigned_handlers: dict[str, Handler] = {}  # subscription_name → callback
+        self._pending_tasks: list[asyncio.Task[None]] = []
 
         self._register_internal_handlers()
 
@@ -164,6 +168,7 @@ class MeadowClient:
         )
         self.sio.on(EventName.AUTH_ERROR.value, self._on_auth_error, namespace=self.NAMESPACE)
         self.sio.on(EventName.ERROR.value, self._on_error, namespace=self.NAMESPACE)
+        self.sio.on(EventName.LABEL_ASSIGNED.value, self._on_label_assigned_event, namespace=self.NAMESPACE)
 
     async def _on_namespace_connect(self) -> None:
         """On /chat connect, send the authenticate event with our JWT.
@@ -172,7 +177,7 @@ class MeadowClient:
         sent directly. Otherwise the token is signed locally using
         ``jwt_secret`` (legacy path).
         """
-        logger.info("connected to %s namespace, authenticating", self.NAMESPACE)
+        logger.debug("SIO /chat connected — emitting authenticate event")
         if self.token:
             token = self.token
         elif self.jwt_secret:
@@ -192,11 +197,12 @@ class MeadowClient:
             {"token": token},
             namespace=self.NAMESPACE,
         )
+        logger.debug("authenticate event emitted, waiting for server response...")
 
     async def _on_namespace_disconnect(self) -> None:
         self._connected = False
         self._authenticated = False
-        logger.info("disconnected from %s namespace", self.NAMESPACE)
+        logger.debug("SIO /chat disconnected")
         for handler in self._disconnect_handlers:
             result = handler()
             if hasattr(result, "__await__"):
@@ -205,15 +211,18 @@ class MeadowClient:
     async def _on_authenticated(self, _data: dict[str, Any]) -> None:
         self._connected = True
         self._authenticated = True
-        logger.info("authenticated as %s", self.claims.name())
+        logger.debug("authenticated as %s", self.claims.name())
         for handler in self._connect_handlers:
             result = handler()
             if hasattr(result, "__await__"):
                 await result
+        # Replay label subscriptions after reconnect
+        for sub_data in self._label_subscriptions:
+            await self.emit(EventName.REGISTER_LABEL_SUBSCRIPTION, sub_data)
 
     async def _on_auth_error(self, data: dict[str, Any]) -> None:
         self._authenticated = False
-        logger.error("auth error: %s", data)
+        logger.error("auth error from server: %s", data)
         raise MeadowClientError(f"authentication failed: {data}")
 
     async def _on_error(self, data: dict[str, Any]) -> None:
@@ -225,13 +234,16 @@ class MeadowClient:
         Returns once the transport is connected; auth completes
         asynchronously via the `_on_authenticated` handler.
         """
+        logger.debug("sio.connect(%s, namespaces=['/chat'], transports=['websocket'])", self.server_url)
         try:
             await self.sio.connect(
                 self.server_url,
                 namespaces=[self.NAMESPACE],
                 transports=["websocket"],
             )
+            logger.debug("sio.connect() returned — transport established")
         except Exception as exc:
+            logger.error("sio.connect() failed: %s: %s", type(exc).__name__, exc)
             raise MeadowClientError(f"failed to connect to {self.server_url}: {exc}") from exc
 
     async def disconnect(self) -> None:
@@ -285,6 +297,67 @@ class MeadowClient:
             namespace=self.NAMESPACE,
         )
         return msg
+
+    def register_label_subscription(
+        self,
+        name: str,
+        predicate: dict[str, Any] | None = None,
+        scope: str = "room",
+        group_id: str | None = None,
+        deliver: str = "label_only",
+    ) -> None:
+        """Register a label subscription with the server.
+
+        BUSINESS RULE (MEADOWS-labeling-intent §2.4): subscriptions live in
+        meadows-client, not meadows-bot.  Both bots and GUI/TUI clients
+        need this.  The client is the transport layer.
+
+        Stores locally for replay on reconnect.
+        """
+        data: dict[str, Any] = {"name": name, "predicate": predicate or {}, "scope": scope, "deliver": deliver}
+        if group_id:
+            data["group_id"] = group_id
+        self._label_subscriptions.append(data)
+        try:
+            loop = asyncio.get_running_loop()
+            self._pending_tasks: list[asyncio.Task[None]] = getattr(self, "_pending_tasks", [])
+            task = loop.create_task(self.emit(EventName.REGISTER_LABEL_SUBSCRIPTION, data))
+            self._pending_tasks.append(task)
+        except RuntimeError:
+            pass  # not in async context — will replay on connect
+
+    def unregister_label_subscription(self, name: str) -> None:
+        """Remove a label subscription by name."""
+        self._label_subscriptions = [s for s in self._label_subscriptions if s["name"] != name]
+        try:
+            loop = asyncio.get_running_loop()
+            self._pending_tasks: list[asyncio.Task[None]] = getattr(self, "_pending_tasks", [])
+            task = loop.create_task(self.emit(EventName.UNREGISTER_LABEL_SUBSCRIPTION, {"name": name}))
+            self._pending_tasks.append(task)
+        except RuntimeError:
+            pass
+
+    def on_label_assigned(self, name: str) -> Callable:
+        """Decorator: register callback for label_assigned events.
+
+        BUSINESS RULE (MEADOWS-labeling-intent §2.4): ``on_label_assigned()``
+        lives in meadows-client so both bots and UI clients can use it.
+        """
+
+        def decorator(func: Handler) -> Handler:
+            self._label_assigned_handlers[name] = func
+            return func
+
+        return decorator
+
+    async def _on_label_assigned_event(self, data: dict[str, Any]) -> None:
+        """Internal: dispatch label_assigned events to registered handlers."""
+        sub_name = data.get("subscription_name")
+        if sub_name and sub_name in self._label_assigned_handlers:
+            handler = self._label_assigned_handlers[sub_name]
+            result = handler(data)
+            if hasattr(result, "__await__"):
+                await result
 
     async def emit(self, event: EventName | str, data: Any) -> None:
         """Emit a raw event. Use sparingly — prefer send_message() for chat.

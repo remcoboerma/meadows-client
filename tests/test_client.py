@@ -331,3 +331,68 @@ class TestAsyncHandlers:
         await fake.trigger(EventName.AUTHENTICATED, {"user_id": "user-alice"})
 
         assert fired == ["ready"]
+
+
+# ---------------------------------------------------------------------------
+# Label subscriptions
+# ---------------------------------------------------------------------------
+
+
+class TestLabelSubscriptions:
+    async def test_register_label_subscription_emits(self):
+        """register_label_subscription stores the subscription."""
+        client, _fake = _make_client()
+        client._connected = True
+        client._authenticated = True
+        client.register_label_subscription("sentiment", {"regex_match": [{"var": "label"}, "^sentiment$"]})
+        assert len(client._label_subscriptions) == 1
+        assert client._label_subscriptions[0]["name"] == "sentiment"
+
+    async def test_unregister_label_subscription_removes(self):
+        """unregister removes from local list."""
+        client, _fake = _make_client()
+        client.register_label_subscription("s1", {})
+        client.register_label_subscription("s2", {})
+        assert len(client._label_subscriptions) == 2
+        client.unregister_label_subscription("s1")
+        assert len(client._label_subscriptions) == 1
+        assert client._label_subscriptions[0]["name"] == "s2"
+
+    async def test_label_assigned_dispatches_to_handler(self):
+        """on_label_assigned decorator registers callback; event dispatches to it."""
+        client, _fake = _make_client()
+        received: list[dict] = []
+
+        @client.on_label_assigned("sentiment")
+        def handler(data: dict) -> None:
+            received.append(data)
+
+        await client._on_label_assigned_event({"subscription_name": "sentiment", "labels": []})
+        assert len(received) == 1
+
+    async def test_label_assigned_no_match_ignored(self):
+        """Event with no matching handler is silently ignored."""
+        client, _fake = _make_client()
+        # Should not raise
+        await client._on_label_assigned_event({"subscription_name": "unknown", "labels": []})
+
+    async def test_subscriptions_stored_for_replay(self):
+        """Subscriptions are kept in _label_subscriptions for replay."""
+        client, _fake = _make_client()
+        client.register_label_subscription("s1", {}, scope="global")
+        assert client._label_subscriptions[0]["scope"] == "global"
+
+    async def test_empty_predicate_sent_as_empty_dict(self):
+        """predicate=None sends {}."""
+        client, _fake = _make_client()
+        client.register_label_subscription("s1", None)
+        assert client._label_subscriptions[0]["predicate"] == {}
+
+    async def test_subscriptions_replayed_on_auth(self):
+        """After AUTHENTICATED, stored subscriptions are re-emitted."""
+        client, fake = _make_client()
+        client.register_label_subscription("s1", {"test": True})
+        fake.emits.clear()
+        await fake.trigger(EventName.AUTHENTICATED, {})
+        emits = [(e, d) for e, d, _ in fake.emits if e == EventName.REGISTER_LABEL_SUBSCRIPTION.value]
+        assert len(emits) >= 1
