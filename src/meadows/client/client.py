@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Any, Awaitable, Callable
 
 import socketio
 
-from meadows.protocol import EventName, JWTClaims, Message, MessageType
+from meadows.protocol import EventName, JWTClaims, Label, Message, MessageType
+from meadows.protocol.envelope import generate_message_id
 from meadows.protocol.jwt import ALGORITHM
 
 import jwt as pyjwt
@@ -90,6 +92,7 @@ class MeadowClient:
         self._disconnect_handlers: list[ConnectHandler] = []
         self._label_subscriptions: list[dict[str, Any]] = []  # for replay on reconnect
         self._label_assigned_handlers: dict[str, Handler] = {}  # subscription_name → callback
+        self._pending_rpc_futures: dict[str, asyncio.Future[str]] = {}  # request_id → Future for call_rpc
         self._pending_tasks: list[asyncio.Task[None]] = []
 
         self._register_internal_handlers()
@@ -169,6 +172,8 @@ class MeadowClient:
         self.sio.on(EventName.AUTH_ERROR.value, self._on_auth_error, namespace=self.NAMESPACE)
         self.sio.on(EventName.ERROR.value, self._on_error, namespace=self.NAMESPACE)
         self.sio.on(EventName.LABEL_ASSIGNED.value, self._on_label_assigned_event, namespace=self.NAMESPACE)
+        # Async RPC: resolve futures when RPC_RESPONSE arrives.
+        self.sio.on(EventName.MESSAGE.value, self._on_rpc_response_message, namespace=self.NAMESPACE)
 
     async def _on_namespace_connect(self) -> None:
         """On /chat connect, send the authenticate event with our JWT.
@@ -358,6 +363,88 @@ class MeadowClient:
             result = handler(data)
             if hasattr(result, "__await__"):
                 await result
+
+    def _on_rpc_response_message(self, data: dict[str, Any]) -> None:
+        """Internal: resolve futures when an RPC_RESPONSE arrives.
+
+        BUSINESS RULE (§2.10): runs on every MESSAGE event.  Checks
+        for RPC_RESPONSE type, extracts request_id from label metadata,
+        and resolves the matching Future created by call_rpc().
+        """
+        if data.get("type") != MessageType.RPC_RESPONSE.value:
+            return
+
+        labels = data.get("labels", [])
+        request_id = None
+        for lbl in labels:
+            if isinstance(lbl, (list, tuple)) and len(lbl) > 3 and isinstance(lbl[3], dict):
+                request_id = lbl[3].get("request_id")
+                if request_id:
+                    break
+
+        if not request_id:
+            return
+
+        fut = self._pending_rpc_futures.pop(request_id, None)
+        if fut and not fut.done():
+            fut.set_result(data.get("content", ""))
+
+    async def call_rpc(
+        self,
+        service_label: str,
+        content: str,
+        *,
+        origin: str | None = None,
+        semver: str = "1.0.0",
+        timeout: float = 30.0,
+        group_id: str = "general",
+    ) -> str:
+        """Send an RPC request and await the response.
+
+        BUSINESS RULE (§2.10): this is the async author surface for
+        RPC across all client types — bots, TUI, GUI.  It sends an
+        RPC_REQUEST, creates an asyncio.Future, and resolves it when
+        the matching RPC_RESPONSE arrives.
+
+        Must be called from an async context.
+
+        Args:
+            service_label: The service label to route to (e.g. "service:math").
+            content: The request payload.
+            origin: Label origin. Defaults to caller's bot_name or sub.
+            semver: Label semver. Defaults to "1.0.0".
+            timeout: Seconds to wait for a response. Default 30.
+            group_id: Group to persist the request/response in.
+
+        Returns:
+            The response content string.
+
+        Raises:
+            asyncio.TimeoutError: if no response arrives within *timeout*.
+        """
+        request_id = uuid.uuid4().hex[:12]
+        origin = origin or self.claims.bot_name or self.claims.sub
+        meta = {"request_id": request_id}
+        msg = Message(
+            id=generate_message_id(),
+            type=MessageType.RPC_REQUEST,
+            user_id=self.claims.sub,
+            bot_name=self.claims.bot_name,
+            group_id=group_id,
+            content=content,
+            labels=[Label(origin, service_label, semver, meta)],
+        )
+        await self.emit(EventName.MESSAGE, msg.model_dump(exclude_none=True))
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        self._pending_rpc_futures[request_id] = future
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_rpc_futures.pop(request_id, None)
+            raise
 
     async def emit(self, event: EventName | str, data: Any) -> None:
         """Emit a raw event. Use sparingly — prefer send_message() for chat.
